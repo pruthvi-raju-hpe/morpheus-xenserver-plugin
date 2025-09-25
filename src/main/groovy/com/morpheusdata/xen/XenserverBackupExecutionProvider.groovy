@@ -28,7 +28,7 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 	XenserverPlugin plugin
 	MorpheusContext morpheusContext
 
-	XenserverBackupExecutionProvider(Plugin plugin, MorpheusContext morpheusContext) {
+	XenserverBackupExecutionProvider(XenserverPlugin plugin, MorpheusContext morpheusContext) {
 		this.plugin = plugin
 		this.morpheusContext = morpheusContext
 	}
@@ -254,8 +254,8 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 			log.info("backup complete: {}", snapshotResults)
 			if(snapshotResults.success) {
 				//save the snapshot
-				Snapshot snapshotRecord = new Snapshot(account:server.account, externalId:snapshotResults.snapshotId, name:"snapshot-${new Date().time}")
-				def snapshot = morpheusContext.services.snapshot.create(snapshotRecord)
+				def newSnapshotRecord = new Snapshot(account:server.account, externalId:snapshotResults.snapshotId, name:"snapshot-${new Date().time}")
+				def snapshot = morpheusContext.services.snapshot.create(newSnapshotRecord)
 				morpheusContext.async.snapshot.addSnapshot(snapshot, server).blockingGet()
 
 				if(backup.copyToStore == true) {
@@ -307,6 +307,7 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 						rtn.data.backupResult.status = BackupResult.Status.SUCCEEDED
 						rtn.data.backupResult.resultPath = outputPath
 						rtn.data.backupResult.resultArchive = archiveName
+						rtn.data.backupResult.resultBucket = bucket.bucketName
 						rtn.data.backupResult.snapshotExtracted = true
 						rtn.data.updates = true
 						if(!backupResult.endDate) {
@@ -317,6 +318,29 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 								def end = rtn.data.backupResult.endDate
 								rtn.data.backupResult.durationMillis = end.time - start.time
 							}
+						}
+
+						// Attempt to delete the temporary snapshot on the hypervisor now that export succeeded
+						try {
+							def deleteResult = XenComputeUtility.destroyVm(authConfig, snapshotResults.snapshotId)
+							log.debug("snapshot destroy result: {}", deleteResult)
+							if(deleteResult?.success) {
+								// remove snapshot record from the compute server if present
+								try {
+									def snapshotRecord = server?.snapshots?.find { it.externalId == snapshotResults.snapshotId }
+									if(snapshotRecord) {
+										server.snapshots.remove(snapshotRecord)
+										morpheusContext.services.computeServer.save(server)
+										morpheusContext.services.snapshot.remove(snapshotRecord)
+									}
+								} catch(ex) {
+									log.warn("failed to remove snapshot record from compute server: {}", ex.message)
+								}
+							}
+						} catch(com.xensource.xenapi.Types.UuidInvalid ignored) {
+							// snapshot not found on xen, continue
+						} catch(e) {
+							log.warn("Error deleting snapshot after export: {}", e.message)
 						}
 					} else {
 						rtn.data.backupResult.status = BackupResult.Status.FAILED
@@ -446,10 +470,35 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 				backupResult.snapshotExtracted = true
 				backupResult.resultPath = outputPath
 				backupResult.resultArchive = archiveName
+				backupResult.resultBucket = bucket.bucketName
 
 				morpheusContext.services.backup.backupResult.save(backupResult)
 				rtn.data = backupResult
 				rtn.success = true
+
+				// Attempt to delete the temporary snapshot on the hypervisor now that export succeeded
+				try {
+					def deleteResult = XenComputeUtility.destroyVm(authConfig, backupResult.snapshotId)
+					log.debug("snapshot destroy result (extract): {}", deleteResult)
+					if(deleteResult?.success) {
+						try {
+							// remove snapshot record from the compute server if present
+							def snapshotRecord = server?.snapshots?.find { it.externalId == backupResult.snapshotId }
+							if(snapshotRecord) {
+								server.snapshots.remove(snapshotRecord)
+								morpheusContext.services.computeServer.save(server)
+								morpheusContext.services.snapshot.remove(snapshotRecord)
+							}
+						} catch(ex) {
+							log.warn("failed to remove snapshot record from compute server (extract): {}", ex.message)
+						}
+					}
+				} catch(com.xensource.xenapi.Types.UuidInvalid ignored) {
+					// snapshot not found on xen, continue
+				} catch(e) {
+					log.warn("Error deleting snapshot after extract: {}", e.message)
+				}
+
 			} else {
 				rtn.msg = "Failed to save backup archive to storage"
 			}
@@ -461,4 +510,4 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 		return rtn
 	}
 
-}		
+}

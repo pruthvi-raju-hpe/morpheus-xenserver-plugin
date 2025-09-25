@@ -266,7 +266,7 @@ class XenserverProvisionProvider extends AbstractProvisionProvider implements Wo
 				code:'provisionType.xen.custom.containerType.logTypeCode',
 				inputType: OptionType.InputType.HIDDEN,
 				name:'log type code',
-				category:'provisionType.xen.custom',
+			 category:'provisionType.xen.custom',
 				fieldName:'logTypeCode',
 				fieldCode: 'gomorpheus.optiontype.LogTypeCode',
 				fieldLabel:'Log Type Code',
@@ -2072,6 +2072,15 @@ class XenserverProvisionProvider extends AbstractProvisionProvider implements Wo
 						response.imagePath = archiveFolder
 						serviceResponse.data = response
 						serviceResponse.success = true
+						// cleanup snapshot now that archive is complete
+						try {
+							def cleanupResult = XenComputeUtility.destroyVm(authConfigMap, snapshotResults.snapshotId)
+							log.debug("importWorkload: snapshot cleanup result: {}", cleanupResult)
+						} catch(com.xensource.xenapi.Types.UuidInvalid ignored) {
+							// already gone
+						} catch(e2) {
+							log.warn("importWorkload: failed to cleanup snapshot ${snapshotResults?.snapshotId}: ${e2.message}")
+						}
 					} else {
 						serviceResponse.success = false
 						serviceResponse.msg = "Failed to export image."
@@ -2088,3 +2097,4 @@ class XenserverProvisionProvider extends AbstractProvisionProvider implements Wo
 		return serviceResponse
 	}
 }
+
