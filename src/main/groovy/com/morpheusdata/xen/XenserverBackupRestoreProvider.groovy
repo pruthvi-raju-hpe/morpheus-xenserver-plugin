@@ -122,7 +122,7 @@ class XenserverBackupRestoreProvider implements BackupRestoreProvider {
 			def snapshotId = backupResult.snapshotId
 			def vmId = backupResult.getConfigProperty("vmId")
 			if(snapshotId) {
-				def sourceWorkload = plugin.morpheus.async.workload.get(opts?.containerId ?: backupResult.containerId).blockingGet()
+				def sourceWorkload = plugin.getMorpheusContext().async.workload.get(opts?.containerId ?: backupResult.containerId).blockingGet()
 				ComputeServer computeServer = sourceWorkload.server
 				Cloud cloud = computeServer.cloud
 				Map authConfig = plugin.getAuthConfig(cloud)

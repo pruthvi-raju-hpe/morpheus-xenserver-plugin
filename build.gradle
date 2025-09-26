@@ -9,7 +9,6 @@ buildscript {
     }
     dependencies {
         classpath "com.github.johnrengelman:shadow:8.1.1"
-//        classpath "com.morpheusdata:morpheus-plugin-gradle:$morpheusApiVersion"
 		classpath "com.morpheusdata:morpheus-plugin-gradle:$morpheusGradleVersion"
         classpath "com.bertramlabs.plugins:asset-pipeline-gradle:$assetPipelineVersion"
     }
@@ -22,6 +21,7 @@ apply plugin: 'idea'
 apply plugin: 'com.github.johnrengelman.shadow'
 apply plugin: 'asset-pipeline'
 apply plugin: 'com.morpheusdata.morpheus-plugin-gradle'
+apply plugin: 'jacoco'
 
 
 group = 'com.morpheusdata.xen'
@@ -66,6 +66,11 @@ dependencies {
 	testImplementation "org.spockframework:spock-core"
 	testImplementation "org.spockframework:spock-junit4"  // you can remove this if your code does not rely on old JUnit 4 rules
 	testImplementation 'cglib:cglib-nodep:3.2.12'
+	testImplementation "com.morpheusdata:morpheus-plugin-api:$morpheusApiVersion"
+
+	// Add Jackson dependencies required by Spock
+	testImplementation 'com.fasterxml.jackson.core:jackson-core:2.15.2'
+	testImplementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
 
 	//http client
 	implementation 'org.apache.httpcomponents:httpclient:4.5.13'
@@ -131,5 +136,50 @@ test {
 		exceptionFormat = 'full'
 		showStandardStreams = true
 	}
+	useJUnitPlatform()
+	finalizedBy jacocoTestReport // Generate coverage report after tests run
 }
+
+jacoco {
+	toolVersion = "0.8.11"
+}
+
+jacocoTestReport {
+	dependsOn test // Tests must run before generating the report
+	reports {
+		xml.required = true
+		html.required = true
+		csv.required = false
+	}
+	afterEvaluate {
+		classDirectories.setFrom(files(classDirectories.files.collect {
+			fileTree(dir: it, exclude: [
+				'**/XenserverPlugin.class',
+				'**/util/**',
+				'**/sync/**'
+			])
+		}))
+	}
+}
+
+jacocoTestCoverageVerification {
+	dependsOn test
+	afterEvaluate {
+		classDirectories.setFrom(files(classDirectories.files.collect {
+			fileTree(dir: it, exclude: [
+				'**/XenserverPlugin.class',
+				'**/util/**',
+				'**/sync/**'
+			])
+		}))
+	}
+	violationRules {
+		rule {
+			limit {
+				minimum = 0.70 // 70% minimum coverage
+			}
+		}
+	}
+}
+
 tasks.assemble.dependsOn tasks.shadowJar

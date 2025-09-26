@@ -995,7 +995,9 @@ class XenserverProvisionProvider extends AbstractProvisionProvider implements Wo
 			def validationResults = XenComputeUtility.validateServerConfig(validationOpts)
 			if(!validationResults.success) {
 				rtn.success = false
-				rtn.errors += validationResults.errors
+				validationResults.errors?.each { error ->
+					rtn.errors[error.field] = error.msg
+				}
 			}
 		} catch(e)  {
 			log.error("error in validateHost: ${e}", e)
@@ -2088,3 +2090,4 @@ class XenserverProvisionProvider extends AbstractProvisionProvider implements Wo
 		return serviceResponse
 	}
 }
+

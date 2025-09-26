@@ -336,6 +336,7 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 			log.error("error in executeBackup: ${e}", e)
 			rtn.data.backupResult.status = BackupResult.Status.FAILED
 			rtn.data.updates = true
+			rtn.msg = e.message ?: e.toString()
 		}
 
 		return rtn
@@ -461,4 +462,4 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 		return rtn
 	}
 
-}		
+}
