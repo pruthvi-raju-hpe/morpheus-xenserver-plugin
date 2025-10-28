@@ -232,8 +232,9 @@ class XenserverBackupExecutionProviderSuccessSpec extends Specification {
 		ServiceResponse<BackupExecutionResponse> resp = provider.executeBackup(backup, backupResult, executionConfig, cloud, server, [:])
 
 		then:
-		resp.success // provider currently sets success true even though status failed
-		resp.data.backupResult.status.toString() == 'FAILED'
+		resp.success
+		resp.data.backupResult.status.toString() == 'SUCCEEDED' // BONUS FIX: copyToStore=false should be SUCCEEDED, not FAILED
+		resp.data.backupResult.snapshotExtracted == false // Snapshot kept on hypervisor
 	}
 
 	def "executeBackup marks failed on snapshot failure"() {

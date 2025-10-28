@@ -295,37 +295,82 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 					exportOpts.authConfig = authConfig
 					log.debug("exportOpts: {}", exportOpts)
 
-					def exportResults = XenComputeUtility.exportVm(exportOpts, snapshotResults.snapshotId)
-					log.debug("exportResults: {}", exportResults)
-					saveThread.join()
-					if(saveResults.success == true && exportResults.success == true) {
-						rtn.success = true
-						rtn.data.backupResult.snapshotId = snapshotResults.snapshotId
-						rtn.data.backupResult.externalId = snapshotResults.snapshotId
-						rtn.data.backupResult.setConfigProperty("vmId", snapshotResults.externalId)
-						rtn.data.backupResult.sizeInMb = (saveResults.archiveSize ?: 1) / ComputeUtility.ONE_MEGABYTE
-						rtn.data.backupResult.status = BackupResult.Status.SUCCEEDED
-						rtn.data.backupResult.resultPath = outputPath
-						rtn.data.backupResult.resultArchive = archiveName
-						rtn.data.backupResult.snapshotExtracted = true
-						rtn.data.updates = true
-						if(!backupResult.endDate) {
-							rtn.data.backupResult.endDate = new Date()
-							def startDate = backupResult.startDate
-							if(startDate) {
-								def start = DateUtility.parseDate(startDate)
-								def end = rtn.data.backupResult.endDate
-								rtn.data.backupResult.durationMillis = end.time - start.time
-							}
+				def exportResults = XenComputeUtility.exportVm(exportOpts, snapshotResults.snapshotId)
+				log.debug("exportResults: {}", exportResults)
+				saveThread.join()
+
+				if(saveResults.success == true && exportResults.success == true) {
+					rtn.success = true
+					rtn.data.backupResult.snapshotId = snapshotResults.snapshotId
+					rtn.data.backupResult.externalId = snapshotResults.snapshotId
+					rtn.data.backupResult.setConfigProperty("vmId", snapshotResults.externalId)
+					rtn.data.backupResult.sizeInMb = (saveResults.archiveSize ?: 1) / ComputeUtility.ONE_MEGABYTE
+					rtn.data.backupResult.status = BackupResult.Status.SUCCEEDED
+					rtn.data.backupResult.resultPath = outputPath
+					rtn.data.backupResult.resultArchive = archiveName
+					rtn.data.backupResult.snapshotExtracted = true
+					rtn.data.updates = true
+					if(!backupResult.endDate) {
+						rtn.data.backupResult.endDate = new Date()
+						def startDate = backupResult.startDate
+						if(startDate) {
+							def start = DateUtility.parseDate(startDate)
+							def end = rtn.data.backupResult.endDate
+							rtn.data.backupResult.durationMillis = end.time - start.time
 						}
-					} else {
-						rtn.data.backupResult.status = BackupResult.Status.FAILED
-						rtn.data.updates = true
 					}
 				} else {
 					rtn.data.backupResult.status = BackupResult.Status.FAILED
 					rtn.data.updates = true
 				}
+
+				// Clean up snapshot from hypervisor after export (regardless of export success/failure)
+				// This prevents orphaned snapshots from accumulating on the hypervisor
+				try {
+					log.debug("Attempting to cleanup snapshot {} from hypervisor after export", snapshotResults.snapshotId)
+					def deleteResult = XenComputeUtility.destroyVm(authConfig, snapshotResults.snapshotId)
+					log.debug("Cleanup snapshot {} after backup export: {}", snapshotResults.snapshotId, deleteResult)
+
+					if(deleteResult?.success) {
+						log.info("Successfully cleaned up snapshot {} from hypervisor after backup export", snapshotResults.snapshotId)
+
+						// Also clean up the snapshot record from the server
+						SnapshotIdentityProjection snapshotRec = server?.snapshots?.find { it.externalId == snapshotResults.snapshotId }
+						if(snapshotRec) {
+							server.snapshots.remove(snapshotRec)
+							morpheusContext.services.computeServer.save(server)
+							morpheusContext.services.snapshot.remove(snapshotRec)
+							log.debug("Removed snapshot record from database: {}", snapshotResults.snapshotId)
+						}
+					} else {
+						log.warn("Failed to cleanup snapshot {} from hypervisor after backup export", snapshotResults.snapshotId)
+					}
+				} catch(com.xensource.xenapi.Types.UuidInvalid ignored) {
+					log.debug("Snapshot {} already deleted or not found during cleanup", snapshotResults.snapshotId)
+				} catch(Exception e) {
+					log.warn("Error cleaning up snapshot {} after backup export: {}", snapshotResults.snapshotId, e.getMessage())
+					// Don't fail the backup if cleanup fails
+				}
+
+			} else {
+				log.info("Snapshot created successfully, copyToStore is false - keeping snapshot on hypervisor")
+				rtn.success = true
+				rtn.data.backupResult.snapshotId = snapshotResults.snapshotId
+				rtn.data.backupResult.externalId = snapshotResults.snapshotId
+				rtn.data.backupResult.setConfigProperty("vmId", snapshotResults.externalId)
+				rtn.data.backupResult.status = BackupResult.Status.SUCCEEDED  // set to SUCCEEDED
+				rtn.data.backupResult.snapshotExtracted = false  // Snapshot on hypervisor
+				rtn.data.updates = true
+				if(!backupResult.endDate) {
+					rtn.data.backupResult.endDate = new Date()
+					def startDate = backupResult.startDate
+					if(startDate) {
+						def start = DateUtility.parseDate(startDate)
+						def end = rtn.data.backupResult.endDate
+						rtn.data.backupResult.durationMillis = end.time - start.time
+					}
+				}
+			}
 			} else {
 				//error
 				rtn.data.backupResult.status = BackupResult.Status.FAILED
@@ -440,6 +485,25 @@ class XenserverBackupExecutionProvider implements BackupExecutionProvider {
 			def exportResults = XenComputeUtility.exportVm(exportOpts, backupResult.snapshotId)
 			log.debug("exportResults: {}", exportResults)
 			saveThread.join()
+
+			// Cleanup snapshot after export attempt
+			try {
+				def destroyResult = XenComputeUtility.destroyVm(authConfig, backupResult.snapshotId)
+				log.debug("Snapshot cleanup result: {}", destroyResult)
+				if(destroyResult?.success) {
+					// Remove snapshot from server record
+					def cleanupSnapshot = server?.snapshots?.find { it.externalId == backupResult.snapshotId }
+					if(cleanupSnapshot) {
+						server.snapshots.remove(cleanupSnapshot)
+						morpheusContext.services.computeServer.save(server)
+						morpheusContext.services.snapshot.remove(cleanupSnapshot)
+					}
+				}
+			} catch(com.xensource.xenapi.Types.UuidInvalid ignored) {
+				log.debug("Snapshot already deleted or not found: {}", backupResult.snapshotId)
+			} catch(Exception e) {
+				log.warn("Failed to cleanup snapshot after export: {}", e.message)
+			}
 
 			if(saveResults.success == true && exportResults.success == true) {
 

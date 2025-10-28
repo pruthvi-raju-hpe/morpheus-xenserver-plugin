@@ -350,6 +350,261 @@ class XenComputeUtility {
 		return rtn
 	}
 
+	/**
+	 * Import a VM from an XVA archive file (file-based version)
+	 * This method imports from a local file path
+	 * @param opts - Map containing authConfig, zone, archivePath (local file path), vmName
+	 * @return Map with success status, vmId (UUID) of imported VM
+	 */
+	static importVmFromArchive(Map opts) {
+		def rtn = [success: false]
+		InputStream archiveStream = null
+		try {
+			// Open the archive file
+			def archiveFile = new File(opts.archivePath)
+			if(!archiveFile.exists()) {
+				rtn.msg = "Archive file not found: ${opts.archivePath}"
+				log.error(rtn.msg)
+				return rtn
+			}
+
+			log.info("Importing VM from archive file: {} ({} bytes)", opts.archivePath, archiveFile.length())
+
+			// Extract XVA from ZIP if needed
+			if(opts.archivePath.endsWith('.zip')) {
+				log.debug("Archive is a ZIP file, extracting XVA...")
+				archiveStream = extractXvaFromZipFile(archiveFile)
+				if(!archiveStream) {
+					rtn.msg = "Failed to extract XVA from ZIP archive"
+					log.error(rtn.msg)
+					return rtn
+				}
+			} else {
+				// Assume it's already an XVA file
+				archiveStream = new FileInputStream(archiveFile)
+			}
+
+			// Use existing importVm method with the stream
+			def importOpts = [
+				authConfig: opts.authConfig,
+				zone: opts.zone,
+				targetSR: opts.targetSR,
+				networkProxy: opts.networkProxy
+			]
+
+			def importResults = importVm(importOpts, archiveStream, opts.vmName)
+
+			if(importResults.success) {
+				rtn.success = true
+				rtn.vmId = importResults.vmId
+				rtn.vmUuid = importResults.vmUuid
+				log.info("Successfully imported VM from archive: {}", opts.vmName)
+			} else {
+				rtn.msg = importResults.msg ?: "Failed to import VM from archive"
+				log.error(rtn.msg)
+			}
+
+		} catch(Exception e) {
+			log.error("importVmFromArchive error: ${e}", e)
+			rtn.msg = "Error importing VM from archive: ${e.message}"
+		} finally {
+			try {
+				archiveStream?.close()
+			} catch(ignored) {}
+		}
+		return rtn
+	}
+
+	/**
+	 * Extract XVA file from ZIP archive (file-based version)
+	 */
+	private static InputStream extractXvaFromZipFile(File zipFile) {
+		try {
+			def tempFile = File.createTempFile("xen-restore-", ".xva")
+			tempFile.deleteOnExit()
+
+			def zis = new java.util.zip.ZipInputStream(new FileInputStream(zipFile))
+			java.util.zip.ZipEntry entry
+
+			boolean found = false
+			while ((entry = zis.getNextEntry()) != null) {
+				if (entry.name.endsWith('.xva')) {
+					log.debug("Found XVA file in ZIP: {}", entry.name)
+					// Extract XVA to temp file
+					tempFile.withOutputStream { out ->
+						byte[] buffer = new byte[8192]
+						int len
+						while ((len = zis.read(buffer)) > 0) {
+							out.write(buffer, 0, len)
+						}
+					}
+					found = true
+					break
+				}
+			}
+			zis.close()
+
+			if (found) {
+				log.debug("Extracted XVA to temp file: {} ({} bytes)", tempFile.absolutePath, tempFile.length())
+				return new FileInputStream(tempFile)
+			} else {
+				log.error("No XVA file found in ZIP archive")
+				return null
+			}
+
+		} catch(Exception e) {
+			log.error("Error extracting XVA from ZIP: ${e}", e)
+			return null
+		}
+	}
+
+	/**
+	 * Import a VM from an XVA archive file stream
+	 * This enables restoring from backups that were exported to external storage
+	 * @param opts - Map containing authConfig, zone, targetSR (SR UUID where VM should be imported)
+	 * @param archiveStream - InputStream of the XVA archive to import
+	 * @param vmName - Optional name for the imported VM
+	 * @return Map with success status, vmId (UUID) of imported VM
+	 */
+	static importVm(Map opts, InputStream archiveStream, String vmName = null) {
+		def rtn = [success: false]
+		try {
+			def config = getXenConnectionSession(opts.authConfig)
+
+			// Build import URL with SR parameter
+			def importUrl = getXenApiUrl(opts.zone, true) + '/import'
+			if(opts.targetSR) {
+				importUrl += "?sr_uuid=${opts.targetSR}"
+			}
+
+			log.info("Importing VM from archive to SR: ${opts.targetSR ?: 'default'}")
+
+			// Upload the XVA archive to XenServer
+			def uploadResults = uploadArchive(opts, importUrl, archiveStream, vmName)
+
+			if(uploadResults.success) {
+				rtn.success = true
+				rtn.vmId = uploadResults.vmId
+				rtn.vmUuid = uploadResults.vmUuid
+				log.info("Successfully imported VM: ${vmName ?: uploadResults.vmId}")
+			} else {
+				rtn.msg = uploadResults.msg ?: "Failed to import VM archive"
+				log.error("Import failed: {}", rtn.msg)
+			}
+		} catch(e) {
+			log.error("importVm error: ${e}", e)
+			rtn.msg = "Error importing VM: ${e.message}"
+		}
+		return rtn
+	}
+
+	/**
+	 * Upload XVA archive to XenServer import endpoint
+	 * Similar to downloadImage but in reverse - uploads instead of downloads
+	 */
+	private static uploadArchive(Map opts, String url, InputStream inputStream, String vmName) {
+		def rtn = [success: false]
+		HttpApiClient client
+		try {
+			client = new HttpApiClient()
+			client.networkProxy = opts.networkProxy
+
+			def authConfig = opts.authConfig
+			def username = authConfig.username ?: authConfig.apiUsername
+			def password = authConfig.password ?: authConfig.apiPassword
+
+			log.debug("Uploading archive to: {}", url)
+
+			// Use HttpApiClient to upload the stream
+			def requestOpts = new HttpApiClient.RequestOptions(
+				ignoreSSL: true,
+				headers: ['Content-Type': 'application/octet-stream']
+			)
+
+			// XenServer import expects HTTP PUT with the XVA stream
+			def apiUrl = new URI(url).toURL()
+			def connection = apiUrl.openConnection()
+			connection.setDoOutput(true)
+			connection.setRequestMethod("PUT")
+			connection.setRequestProperty("Content-Type", "application/octet-stream")
+
+			// Add basic auth
+			def credentials = "${username}:${password}"
+			def encodedCredentials = credentials.bytes.encodeBase64().toString()
+			connection.setRequestProperty("Authorization", "Basic ${encodedCredentials}")
+
+			// Stream the archive to XenServer
+			connection.outputStream.withStream { outStream ->
+				byte[] buffer = new byte[8192]
+				int bytesRead
+				while ((bytesRead = inputStream.read(buffer)) != -1) {
+					outStream.write(buffer, 0, bytesRead)
+				}
+				outStream.flush()
+			}
+
+			// Get response
+			def responseCode = connection.responseCode
+			if(responseCode >= 200 && responseCode < 300) {
+				// Parse response to get VM reference
+				def responseText = connection.inputStream.text
+				log.debug("Import response: {}", responseText)
+
+				// XenServer returns a task reference or VM reference
+				// For now, we'll parse the response to extract the VM UUID
+				def vmUuid = parseImportResponse(responseText)
+
+				rtn.success = true
+				rtn.vmId = vmUuid
+				rtn.vmUuid = vmUuid
+			} else {
+				def errorText = connection.errorStream?.text ?: "No error details"
+				rtn.msg = "HTTP ${responseCode}: ${errorText}"
+				log.error("Upload failed with status {}: {}", responseCode, errorText)
+			}
+
+		} catch(e) {
+			log.error("uploadArchive error: ${e}", e)
+			rtn.msg = e.message
+		} finally {
+			try {
+				inputStream?.close()
+			} catch(ignored) {}
+		}
+		return rtn
+	}
+
+	/**
+	 * Parse XenServer import response to extract VM UUID
+	 * XenServer may return XML-RPC or plain text response with VM reference
+	 */
+	private static String parseImportResponse(String responseContent) {
+		try {
+			// XenServer typically returns the VM reference in the response
+			// Format can be: <value>OpaqueRef:xxx</value> or just a UUID
+			if(responseContent.contains('OpaqueRef:')) {
+				// Extract OpaqueRef
+				def matcher = responseContent =~ /OpaqueRef:([a-f0-9\-]+)/
+				if(matcher.find()) {
+					return matcher.group(1)
+				}
+			}
+
+			// Try to find UUID pattern
+			def uuidMatcher = responseContent =~ /([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/
+			if(uuidMatcher.find()) {
+				return uuidMatcher.group(1)
+			}
+
+			// If no UUID found, return the whole response (will need manual handling)
+			log.warn("Could not parse VM UUID from response, returning raw response")
+			return responseContent.trim()
+		} catch(e) {
+			log.error("Error parsing import response: ${e}", e)
+			return null
+		}
+	}
+
 	static stopVmClean(Map authConfig, String vmId) {
 		def rtn = [success: false]
 		try {

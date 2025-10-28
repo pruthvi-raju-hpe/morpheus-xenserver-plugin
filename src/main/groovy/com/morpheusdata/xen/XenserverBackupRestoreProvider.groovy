@@ -1,5 +1,6 @@
 package com.morpheusdata.xen
 
+import com.bertramlabs.plugins.karman.CloudFile
 import com.morpheusdata.core.MorpheusContext
 import com.morpheusdata.core.backup.BackupRestoreProvider
 import com.morpheusdata.core.backup.response.BackupRestoreResponse
@@ -12,6 +13,8 @@ import com.morpheusdata.model.Backup;
 import com.morpheusdata.model.Instance
 import com.morpheusdata.xen.util.XenComputeUtility
 import groovy.util.logging.Slf4j
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipEntry
 
 @Slf4j
 class XenserverBackupRestoreProvider implements BackupRestoreProvider {
@@ -107,8 +110,26 @@ class XenserverBackupRestoreProvider implements BackupRestoreProvider {
 
 	/**
 	 * Execute the backup restore on the external system
+	 *
+	 * IMPLEMENTATION NOTES:
+	 * This method supports two types of backups:
+	 *
+	 * 1. NEW BACKUPS (with snapshot cleanup):
+	 *    - Snapshot was deleted after export to external storage
+	 *    - backupResult.snapshotExtracted = true indicates archive exists
+	 *    - Restores from archive using importVm()
+	 *
+	 * 2. LEGACY BACKUPS (pre-snapshot-cleanup):
+	 *    - Snapshot still exists in Xen storage
+	 *    - Restore uses snapshot.revert() on the existing snapshot
+	 *    - Works as before for backward compatibility
+	 *
+	 * RESTORE FLOW:
+	 *   - If archive exists: Download → Extract XVA → Import to Xen
+	 *   - If archive fails or doesn't exist: Fall back to snapshot.revert()
+	 *
 	 * @param backupRestoreModel restore to be executed
-	 * @param backupResultModel refernce to the backup result
+	 * @param backupResultModel reference to the backup result
 	 * @param backupModel reference to the backup associated with the backup result
 	 * @param opts optional parameters
 	 * @return a {@link ServiceResponse} object. A ServiceResponse with a false success will indicate a failed
@@ -118,35 +139,264 @@ class XenserverBackupRestoreProvider implements BackupRestoreProvider {
 	ServiceResponse restoreBackup(BackupRestore backupRestore, BackupResult backupResult, Backup backup, Map opts) {
 		log.debug("restoreBackup {}", backupResult)
 		ServiceResponse rtn = ServiceResponse.prepare(new BackupRestoreResponse(backupRestore))
-		try{
+		try {
 			def snapshotId = backupResult.snapshotId
 			def vmId = backupResult.getConfigProperty("vmId")
-			if(snapshotId) {
-				def sourceWorkload = plugin.getMorpheusContext().async.workload.get(opts?.containerId ?: backupResult.containerId).blockingGet()
-				ComputeServer computeServer = sourceWorkload.server
-				Cloud cloud = computeServer.cloud
-				Map authConfig = plugin.getAuthConfig(cloud)
-				//execute restore
+
+			// Determine backup type
+			def isExtractedBackup = backupResult.snapshotExtracted == true
+			def hasArchive = backupResult.resultArchive != null && backupResult.resultPath != null
+
+			log.info("Restore backup type - snapshotExtracted: {}, hasArchive: {}, snapshotId: {}",
+				isExtractedBackup, hasArchive, snapshotId)
+
+			// Get workload and cloud context
+			def containerId = opts?.containerId ?: backupResult.containerId
+			def sourceWorkload = plugin.getMorpheusContext().async.workload.get(containerId).blockingGet()
+			ComputeServer computeServer = sourceWorkload.server
+			Cloud cloud = computeServer.cloud
+			Map authConfig = plugin.getAuthConfig(cloud)
+
+			// Try archive-based restore for new backups first
+			if (isExtractedBackup && hasArchive) {
+				log.info("Attempting archive-based restore from {}/{}", backupResult.resultPath, backupResult.resultArchive)
+				try {
+					def archiveRestoreResults = restoreFromArchive(backup, backupResult, computeServer, cloud, authConfig)
+					if (archiveRestoreResults.success) {
+						rtn.data.backupRestore.status = BackupResult.Status.SUCCEEDED
+						rtn.data.updates = true
+						rtn.success = true
+
+						// Start the restored VM
+						def newVmId = archiveRestoreResults.vmId
+						log.info("Starting restored VM: {}", newVmId)
+						def startVm = XenComputeUtility.startVm(authConfig, newVmId)
+						if (!startVm.success) {
+							log.warn("VM restored successfully but failed to start: {}", startVm.msg)
+						}
+
+						return rtn
+					}
+					log.warn("Archive restore failed, falling back to snapshot restore: {}", archiveRestoreResults.msg)
+				} catch(Exception e) {
+					log.error("Archive restore error, falling back to snapshot restore: ${e}", e)
+				}
+			}
+
+			// Fallback to snapshot-based restore (legacy method or fallback)
+			if (snapshotId) {
+				log.info("Attempting snapshot-based restore using snapshot ID: {}", snapshotId)
 				def restoreResults = XenComputeUtility.restoreServer(authConfig, snapshotId)
 				log.debug("restore results: {}", restoreResults)
-				if(restoreResults.success){
+
+				if (restoreResults.success) {
 					rtn.data.backupRestore.status = BackupResult.Status.SUCCEEDED
 					rtn.data.updates = true
 					rtn.success = true
 
-					//restore stops the vm, so need to restart it
+					// Restart VM after snapshot restore
 					def startVm = XenComputeUtility.startVm(authConfig, vmId)
+					if (!startVm.success) {
+						log.warn("VM restored successfully but failed to start: {}", startVm.msg)
+					}
 				} else {
 					rtn.data.backupRestore.status = BackupResult.Status.FAILED
 					rtn.data.updates = true
+
+					// Provide helpful error message based on backup type
+					if (isExtractedBackup && hasArchive) {
+						rtn.msg = "Both archive and snapshot restore failed. The archive restore encountered an error, " +
+							"and the snapshot may have been deleted. Check logs for details."
+					} else if (isExtractedBackup) {
+						rtn.msg = "Snapshot-based restore failed. This backup was created with snapshot cleanup enabled, " +
+							"but no archive was found. The snapshot may no longer exist in Xen storage."
+					} else {
+						rtn.msg = "Snapshot-based restore failed. The snapshot may have been deleted or is no longer accessible."
+					}
 				}
+			} else {
+				log.warn("No snapshot ID found for backup result {}", backupResult.id)
+				rtn.msg = "No snapshot or archive available for restore"
+				rtn.data.backupRestore.status = BackupResult.Status.FAILED
+				rtn.data.updates = true
+				rtn.success = false
 			}
-		} catch(e) {
+		} catch (com.xensource.xenapi.Types.UuidInvalid e) {
+			log.error("Snapshot not found in Xen storage: {}", e.getMessage())
+			rtn.data.backupRestore.status = BackupResult.Status.FAILED
+			rtn.data.updates = true
+
+			def isExtractedBackup = backupResult.snapshotExtracted == true
+			if (isExtractedBackup) {
+				rtn.msg = "Snapshot not found in Xen storage. This backup was created with snapshot cleanup enabled. " +
+					"Archive-based restore was attempted but may have failed. Check logs for details."
+			} else {
+				rtn.msg = "Snapshot not found in Xen storage. The snapshot may have been manually deleted."
+			}
+
+			rtn.success = false
+		} catch (Exception e) {
 			log.error("restoreBackup: ${e}", e)
 			rtn.msg = e.getMessage()
 			rtn.success = false
 		}
 		return rtn
+	}
+
+	/**
+	 * Restore VM from exported archive in external storage
+	 */
+	private Map restoreFromArchive(Backup backup, BackupResult backupResult,
+	                                ComputeServer targetServer, Cloud cloud, Map authConfig) {
+		def rtn = [success: false]
+		InputStream xvaStream = null
+		String importedVmId = null
+		try {
+			log.info("Starting archive-based restore for backup result {}", backupResult.id)
+
+			// Get storage provider and download archive
+			def bucket = morpheusContext.services.backup.getBackupStorageBucket(backup.account, backup.id)
+			def provider = morpheusContext.services.backup.getBackupStorageProvider(bucket.id)
+
+			def archivePath = backupResult.resultPath
+			def archiveName = backupResult.resultArchive
+
+			log.debug("Downloading archive from {}/{}", archivePath, archiveName)
+			CloudFile archiveFile = provider[archivePath][archiveName]
+
+			if (!archiveFile.exists()) {
+				rtn.msg = "Backup archive not found: ${archivePath}/${archiveName}"
+				log.error(rtn.msg)
+				return rtn
+			}
+
+			// Extract XVA from ZIP archive
+			log.debug("Extracting XVA from ZIP archive, size: {} bytes", archiveFile.contentLength)
+			xvaStream = extractXvaFromZip(archiveFile.inputStream)
+
+			if (!xvaStream) {
+				rtn.msg = "Failed to extract XVA from archive"
+				log.error(rtn.msg)
+				return rtn
+			}
+
+			// Get target SR for import
+			def targetSR = getTargetSR(targetServer, cloud, authConfig)
+			if (!targetSR) {
+				rtn.msg = "Could not determine target SR for VM import"
+				log.error(rtn.msg)
+				return rtn
+			}
+
+			// Prepare import options
+			def importOpts = [
+				authConfig: authConfig,
+				zone: cloud,
+				targetSR: targetSR,
+				networkProxy: cloud.apiProxy
+			]
+
+			// Import the VM
+			def vmName = "${targetServer.name}-restored-${System.currentTimeMillis()}"
+			log.info("Importing VM '{}' to SR: {}", vmName, targetSR)
+
+			def importResults = XenComputeUtility.importVm(importOpts, xvaStream, vmName)
+			importedVmId = importResults.vmId
+			if (importResults.success) {
+				rtn.success = true
+				rtn.vmId = importResults.vmId
+				rtn.vmUuid = importResults.vmUuid
+				log.info("Successfully restored VM from archive: {} (UUID: {})", vmName, rtn.vmId)
+			} else {
+				rtn.msg = "Failed to import VM: ${importResults.msg}"
+				log.error(rtn.msg)
+			}
+		} catch(Exception e) {
+			log.error("restoreFromArchive error: ${e}", e)
+			rtn.msg = "Archive restore failed: ${e.message}"
+			// Cleanup imported VM on failure
+			if (importedVmId) {
+				try {
+					log.warn("Cleaning up partially imported VM: {}", importedVmId)
+					XenComputeUtility.destroyVm(authConfig, importedVmId)
+				} catch(Exception cleanupEx) {
+					log.error("Failed to cleanup imported VM: {}", cleanupEx.message)
+				}
+			}
+		} finally {
+			try {
+				xvaStream?.close()
+			} catch(ignored) {}
+		}
+		return rtn
+	}
+
+	/**
+	 * Extract XVA file from ZIP archive
+	 */
+	private InputStream extractXvaFromZip(InputStream zipStream) {
+		InputStream xvaStream = null
+		try {
+			def tempFile = File.createTempFile("xen-restore-", ".xva")
+			tempFile.deleteOnExit()
+
+			def zis = new ZipInputStream(zipStream)
+			ZipEntry entry
+
+			boolean found = false
+			while ((entry = zis.getNextEntry()) != null) {
+				if (entry.name.endsWith('.xva')) {
+					log.debug("Found XVA file in archive: {}", entry.name)
+					// Extract XVA to temp file
+					tempFile.withOutputStream { out ->
+						byte[] buffer = new byte[8192]
+						int len
+						while ((len = zis.read(buffer)) > 0) {
+							out.write(buffer, 0, len)
+						}
+					}
+					found = true
+					break
+				}
+			}
+			zis.close()
+
+			if (found) {
+				xvaStream = new FileInputStream(tempFile)
+				log.debug("Extracted XVA to temp file: {} ({} bytes)", tempFile.absolutePath, tempFile.length())
+			} else {
+				log.error("No XVA file found in ZIP archive")
+			}
+
+		} catch(Exception e) {
+			log.error("Error extracting XVA from ZIP: ${e}", e)
+		}
+		return xvaStream
+	}
+
+	/**
+	 * Get target SR for VM import
+	 */
+	private String getTargetSR(ComputeServer server, Cloud cloud, Map authConfig) {
+		try {
+			// First try to get SR from server config
+			def srFromConfig = server.getConfigProperty("datastore")
+			if (srFromConfig) {
+				log.debug("Using SR from server config: {}", srFromConfig)
+				return srFromConfig
+			}
+
+			// Fall back to default SR from pool
+			def config = XenComputeUtility.getXenConnectionSession(authConfig)
+			def pool = com.xensource.xenapi.Pool.getAll(config.connection).first()
+			def defaultSR = pool.getDefaultSR(config.connection)
+			def srUuid = defaultSR.getUuid(config.connection)
+			log.debug("Using default SR from pool: {}", srUuid)
+			return srUuid
+		} catch(Exception e) {
+			log.error("Failed to get target SR: ${e}", e)
+			return null
+		}
 	}
 
 	/**
